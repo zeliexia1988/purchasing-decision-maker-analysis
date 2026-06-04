@@ -204,6 +204,81 @@ def archive_to_sheets(df):
         return False, f"云端存档失败: {e}"
 
 # ===============================
+# 5b. 根据报价参数匹配合同价格（两段式：优先本供应商，退回市场最低）
+# ===============================
+def lookup_contract_price(row, today=None):
+    """
+    返回 (合同单价, 来源说明)
+    1. 先按 Material/DE/PN/Package 锁定规格
+    2. 若报价供应商在该规格下有合同 -> 用其合同价（来源=Contrat 供应商）
+    3. 否则 -> 取该规格市场最低合同价（来源=Marché min）
+    """
+    if contracts is None:
+        return None, ""
+    if today is None:
+        today = datetime.today()
+
+    try:
+        de_val = float(row.get("DE")) if pd.notna(row.get("DE")) and str(row.get("DE")).strip() != "" else None
+        pn_val = float(row.get("PN")) if pd.notna(row.get("PN")) and str(row.get("PN")).strip() != "" else None
+    except (ValueError, TypeError):
+        return None, ""
+
+    material = str(row.get("Material", "")).strip().lower()
+    package = str(row.get("Package", "")).strip().lower()
+    supplier = str(row.get("Fournisseur", "")).strip()
+
+    # 第一步：按规格筛选（不含 supplier）
+    mask = (contracts["Valid_Until"] >= today)
+    if material:
+        mask &= (contracts["Material"].astype(str).str.strip().str.lower() == material)
+    if de_val is not None:
+        mask &= (contracts["DE"] == de_val)
+    if pn_val is not None:
+        mask &= (contracts["PN"] == pn_val)
+    if package:
+        mask &= (contracts["Package"].astype(str).str.strip().str.lower() == package)
+
+    spec_matches = contracts[mask]
+    if spec_matches.empty:
+        return None, ""
+
+    # 第二步：优先本供应商的合同价
+    if supplier:
+        own = spec_matches[
+            spec_matches["Supplier"].astype(str).str.contains(supplier, case=False, na=False)
+        ]
+        if not own.empty:
+            return own["Price"].min(), f"Contrat {supplier}"
+
+    # 第三步：退回市场最低合同价
+    best = spec_matches.loc[spec_matches["Price"].idxmin()]
+    return best["Price"], f"Marché min ({best['Supplier']})"
+
+
+def add_contract_prices(df):
+    """给报价 DataFrame 增加合同价列、来源列与对比列"""
+    df = df.copy()
+
+    results = df.apply(lambda r: lookup_contract_price(r), axis=1)
+    df["Prix_contrat"] = [r[0] for r in results]
+    df["Source_contrat"] = [r[1] for r in results]
+
+    def calc_ecart(r):
+        try:
+            pu = float(r.get("Prix_unitaire"))
+            pc = r.get("Prix_contrat")
+            if pc is None or pd.isna(pc):
+                return None
+            return round(pu - pc, 2)
+        except (ValueError, TypeError):
+            return None
+
+    df["Ecart_vs_contrat"] = df.apply(calc_ecart, axis=1)
+    return df
+
+
+# ===============================
 # 6. Excel 导出
 # ===============================
 def to_excel_bytes(df):
@@ -322,6 +397,7 @@ with tab2:
 
         if all_dfs:
             consolidated = pd.concat(all_dfs, ignore_index=True)
+            consolidated = add_contract_prices(consolidated)   # 新增合同价/来源/价差列
             st.session_state["quote_df"] = consolidated
             progress.empty()
             st.success(f"✅ {len(consolidated)} ligne(s) extraite(s) depuis {len(uploaded_files)} fichier(s).")
@@ -347,5 +423,7 @@ with tab2:
                 ok, msg = archive_to_sheets(edited)
                 if ok:
                     st.success(msg)
+                else:
+                    st.warning(msg)
                 else:
                     st.warning(msg)
