@@ -4,6 +4,8 @@ import math
 import urllib.parse
 import json
 import io
+import re
+import time
 from datetime import datetime
 
 # 报价分析模块依赖
@@ -123,117 +125,213 @@ def calculate_all_totals(material, de, pn, quantity, package, dept_code, today):
     return display_df.sort_values("TOTAL HT")
 
 # ===============================
-# 4. 报价提取核心函数 (PDF -> 图片 -> Gemini -> JSON)
+# 4. 报价提取核心函数
 # ===============================
 QUOTE_FIELDS = ["Fournisseur", "Material", "DE", "PN", "Package",
                 "Quantite_ml", "Prix_unitaire", "Devise", "Delai", "Date_validite"]
 
-def extract_quote_from_pdf(pdf_bytes):
+
+def _get_model():
+    """初始化 Gemini，未配置 key 时返回 None"""
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         st.error("⚠️ 未配置 GEMINI_API_KEY，请在 Streamlit Secrets 中添加。")
         return None
-
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel("gemini-2.5-flash")
 
-    images = convert_from_bytes(pdf_bytes, dpi=150)
 
-    prompt = f"""Tu es un assistant achats. Analyse ce devis fournisseur (canalisation/tuyauterie)
-et extrais TOUTES les lignes de produits sous forme de tableau JSON.
+def _call_gemini(model, content, label="", max_retries=3):
+    """带限流重试的 Gemini 调用，返回清理后的文本或 None"""
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(content)
+            return response.text.strip().replace("```json", "").replace("```", "").strip()
+        except Exception as e:
+            msg = str(e)
+            is_quota = ("ResourceExhausted" in str(type(e)) or "429" in msg
+                        or "quota" in msg.lower() or "exhausted" in msg.lower())
+            if is_quota and attempt < max_retries - 1:
+                wait = 30 * (attempt + 1)
+                st.warning(f"⏳ 触发速率限制，{wait}秒后重试 ({attempt + 1}/{max_retries})… {label}")
+                time.sleep(wait)
+            elif is_quota:
+                st.error(f"⚠️ 多次重试后仍被限流。免费层限额较低，请减少同时上传的文件数，"
+                         f"或稍后再试。{label}")
+                return None
+            else:
+                st.error(f"调用模型失败 {label}: {e}")
+                return None
+    return None
 
-Renvoie UNIQUEMENT un tableau JSON (pas de texte, pas de markdown), où chaque objet a ces clés exactes:
-{json.dumps(QUOTE_FIELDS, ensure_ascii=False)}
 
-Règles:
-- Fournisseur: nom du fournisseur émetteur du devis
-- DE: diamètre extérieur (nombre uniquement)
-- PN: pression nominale (nombre uniquement)
-- Package: conditionnement (barre, couronne, touret...)
-- Quantite_ml: quantité en mètres linéaires (nombre)
-- Prix_unitaire: prix unitaire en €/ml (nombre uniquement, sans symbole)
-- Devise: ex "EUR"
-- Delai: délai de livraison si mentionné, sinon ""
-- Date_validite: date de validité de l'offre si mentionnée, sinon ""
-- Si une valeur est absente, mets "" (chaîne vide) ou null.
-- Une ligne par produit/référence."""
-
-    content = [prompt] + images
-
-    response = model.generate_content(content)
-    raw = response.text.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-
+def _parse_json_rows(raw, label=""):
+    """把模型返回文本解析成 DataFrame"""
+    if raw is None:
+        return None
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
             data = [data]
         return pd.DataFrame(data)
     except json.JSONDecodeError:
-        st.error("模型返回的不是有效 JSON，原始输出如下:")
-        st.code(raw)
+        st.error(f"模型返回的不是有效 JSON {label}，原始输出如下:")
+        st.code(raw[:3000])
         return None
+
+
+PROMPT_RULES = f"""Renvoie UNIQUEMENT un tableau JSON (pas de texte, pas de markdown),
+où chaque objet a ces clés exactes:
+{json.dumps(QUOTE_FIELDS, ensure_ascii=False)}
+
+Règles:
+- Fournisseur: nom du fournisseur émetteur du devis
+- DE: diamètre extérieur ou DN (nombre uniquement)
+- PN: pression nominale (nombre uniquement)
+- Package: conditionnement (barre, couronne, touret...)
+- Quantite_ml: quantité (nombre)
+- Prix_unitaire: prix unitaire (nombre uniquement, sans symbole)
+- Devise: ex "EUR", "USD"
+- Delai: délai de livraison si mentionné, sinon ""
+- Date_validite: date de validité de l'offre si mentionnée, sinon ""
+- Si une valeur est absente, mets "" ou null.
+- Une ligne par produit/référence."""
+
+
+def extract_quote_from_pdf(pdf_bytes, label=""):
+    """PDF -> 图片 -> Gemini 多模态 -> 结构化 JSON"""
+    model = _get_model()
+    if model is None:
+        return None
+
+    images = convert_from_bytes(pdf_bytes, dpi=150)
+    prompt = ("Tu es un assistant achats. Analyse ce devis fournisseur "
+              "(canalisation/tuyauterie) et extrais TOUTES les lignes de produits.\n\n"
+              + PROMPT_RULES)
+    raw = _call_gemini(model, [prompt] + images, label=label)
+    return _parse_json_rows(raw, label=label)
+
+
+# ---- Excel：pandas 切表 + Gemini 仅映射列名 + pandas 批量转换 ----
+HEADER_KEYWORDS = ["dn", "diam", "precio", "price", "prix", "preço", "cant", "qty",
+                   "quant", "codigo", "código", "code", "descrip", "denomin",
+                   "unit", "p.u", "peso", "pn", "référence", "designation", "désignation"]
+
+
+def _detect_header_row(raw_df):
+    """找出最像表头的行号（匹配关键词最多的行）"""
+    def score(row):
+        cells = [str(x).strip().lower() for x in row if str(x).strip() and str(x) != "nan"]
+        return sum(any(k in c for c in cells) for k in HEADER_KEYWORDS)
+    scores = raw_df.apply(lambda r: score(r.tolist()), axis=1)
+    if scores.max() < 2:          # 关键词太少，判定为非规整表
+        return None
+    return int(scores.idxmax())
+
+
+def _is_number(x):
+    try:
+        float(str(x).replace(",", ".").strip())
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _extract_pn(txt):
+    m = re.search(r'PN\s*?(\d{1,3})', str(txt), re.I)
+    return m.group(1) if m else ""
 
 
 def extract_quote_from_excel(file_bytes, filename):
-    """Excel 报价 -> 文本 -> Gemini -> 结构化 JSON（与 PDF 共用字段）"""
-    api_key = st.secrets.get("GEMINI_API_KEY")
-    if not api_key:
-        st.error("⚠️ 未配置 GEMINI_API_KEY，请在 Streamlit Secrets 中添加。")
-        return None
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
-
-    # 读取所有 sheet，拼成文本（保留行列结构）
+    """
+    规整表：pandas 定位表头+数据区，只把表头发给 Gemini 做列名映射，
+            再用 pandas 批量转换全部行（零逐行 LLM、不限流、不丢行）。
+    乱表：  退回整表文本发 Gemini。
+    """
     try:
-        sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
+        raw_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None, dtype=str)
     except Exception as e:
         st.error(f"读取 Excel 失败 ({filename}): {e}")
         return None
 
-    text_parts = []
-    for sheet_name, sdf in sheets.items():
-        text_parts.append(f"--- Feuille: {sheet_name} ---")
-        text_parts.append(sdf.to_csv(index=False, header=False))
-    excel_text = "\n".join(text_parts)
+    header_idx = _detect_header_row(raw_df)
 
-    prompt = f"""Tu es un assistant achats. Voici le contenu d'un devis fournisseur
-(canalisation/tuyauterie) exporté depuis un fichier Excel. Les colonnes peuvent
-avoir des noms variables selon le fournisseur.
+    # ---------- 情况 A：识别到规整表头 ----------
+    if header_idx is not None:
+        header = [str(x).strip() for x in raw_df.iloc[header_idx].fillna("").tolist()]
+        data = raw_df.iloc[header_idx + 1:].copy()
+        data.columns = range(len(header))
 
-Extrais TOUTES les lignes de produits sous forme de tableau JSON.
-Renvoie UNIQUEMENT un tableau JSON (pas de texte, pas de markdown), où chaque objet a ces clés exactes:
-{json.dumps(QUOTE_FIELDS, ensure_ascii=False)}
+        # 只保留首列为数字编号的产品行（去掉单位说明、合计、条款）
+        data = data[data[0].apply(_is_number)].reset_index(drop=True)
+        if data.empty:
+            # 首列不是编号？放宽：保留至少一半单元格非空的行
+            data = raw_df.iloc[header_idx + 1:].copy()
+            data.columns = range(len(header))
+            keep = data.apply(lambda r: r.notna().sum() >= len(header) / 2, axis=1)
+            data = data[keep].reset_index(drop=True)
 
-Règles:
-- Fournisseur: nom du fournisseur émetteur du devis
-- DE: diamètre extérieur (nombre uniquement)
-- PN: pression nominale (nombre uniquement)
-- Package: conditionnement (barre, couronne, touret...)
-- Quantite_ml: quantité en mètres linéaires (nombre)
-- Prix_unitaire: prix unitaire en €/ml (nombre uniquement, sans symbole)
-- Devise: ex "EUR"
-- Delai: délai de livraison si mentionné, sinon ""
-- Date_validite: date de validité de l'offre si mentionnée, sinon ""
-- Si une valeur est absente, mets "" ou null.
-- Une ligne par produit/référence.
+        # 让 Gemini 只映射列名 -> 列索引（小请求，省额度不丢行）
+        model = _get_model()
+        if model is None:
+            return None
+        header_desc = "\n".join(f"  [{i}] {h}" for i, h in enumerate(header) if h)
+        map_prompt = f"""Tu mappes les colonnes d'un devis vers des champs standard.
+Colonnes disponibles (index entre crochets):
+{header_desc}
 
-Contenu du fichier Excel:
-{excel_text}"""
+Renvoie UNIQUEMENT un objet JSON associant chaque champ standard à l'INDEX de colonne
+correspondant (entier), ou null si absent. Champs:
+- "DE": diamètre extérieur / DN
+- "Material": désignation / description du produit
+- "Package": conditionnement (barre/couronne/touret) si présent
+- "Quantite_ml": quantité
+- "Prix_unitaire": prix unitaire
 
-    response = model.generate_content(prompt)
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+Exemple de sortie: {{"DE": 3, "Material": 2, "Package": null, "Quantite_ml": 6, "Prix_unitaire": 8}}"""
 
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        return pd.DataFrame(data)
-    except json.JSONDecodeError:
-        st.error(f"模型返回的不是有效 JSON ({filename})，原始输出如下:")
-        st.code(raw)
+        raw_map = _call_gemini(model, map_prompt, label=f"[{filename} en-têtes]")
+        if raw_map is None:
+            return None
+        try:
+            col_map = json.loads(raw_map)
+        except json.JSONDecodeError:
+            st.warning(f"列名映射解析失败，退回整表模式 ({filename})。")
+            col_map = None
+
+        if col_map:
+            out = pd.DataFrame()
+            for field in ["DE", "Material", "Package", "Quantite_ml", "Prix_unitaire"]:
+                idx = col_map.get(field)
+                out[field] = data[idx] if (idx is not None and idx in data.columns) else ""
+
+            # PN：优先描述里正则提取
+            out["PN"] = out["Material"].apply(_extract_pn)
+            # 供应商/货币：整表第一次出现的线索由 Gemini 之外简单补；留空交由用户校对
+            out["Fournisseur"] = ""
+            out["Devise"] = ""
+            out["Delai"] = ""
+            out["Date_validite"] = ""
+
+            # 清理：DE/数量/单价转为去千分位的字符串
+            for c in ["DE", "Quantite_ml", "Prix_unitaire"]:
+                out[c] = out[c].apply(lambda v: str(v).strip() if pd.notna(v) else "")
+            # 去掉 DE 非数字的残留行（单位说明等）
+            out = out[out["DE"].apply(lambda x: _is_number(x) or x == "")].reset_index(drop=True)
+            out = out[QUOTE_FIELDS]
+            return out
+
+    # ---------- 情况 B：乱表，整表文本发 Gemini ----------
+    model = _get_model()
+    if model is None:
         return None
+    excel_text = raw_df.to_csv(index=False, header=False)
+    prompt = ("Tu es un assistant achats. Voici un devis fournisseur "
+              "(canalisation/tuyauterie) exporté depuis Excel. Les colonnes ont des noms "
+              "variables.\n\nExtrais TOUTES les lignes de produits.\n\n"
+              + PROMPT_RULES + f"\n\nContenu:\n{excel_text}")
+    raw = _call_gemini(model, prompt, label=f"[{filename}]")
+    return _parse_json_rows(raw, label=f"[{filename}]")
 
 # ===============================
 # 5. Google Sheets 存档 (未配置时静默跳过)
@@ -439,13 +537,20 @@ with tab1:
 # ---------- 标签页 2：报价分析 ----------
 with tab2:
     st.header("📄 Analyse automatique des devis")
-    st.caption("Uploadez un ou plusieurs PDF de devis. Les données seront extraites et consolidées.")
+    st.caption("Uploadez un ou plusieurs devis (PDF ou Excel). Les données seront extraites et consolidées.")
+    st.info("💡 Conseil : déposez **10 fichiers maximum** à la fois (limite du quota gratuit Gemini). "
+            "Pour traiter davantage de devis, faites plusieurs lots espacés d'une à deux minutes.")
 
     uploaded_files = st.file_uploader(
         "Déposez vos devis (PDF ou Excel)",
         type=["pdf", "xlsx", "xls"],
         accept_multiple_files=True
     )
+
+    if uploaded_files and len(uploaded_files) > 10:
+        st.warning(f"⚠️ Vous avez sélectionné {len(uploaded_files)} fichiers. "
+                   f"Au-delà de 10, le traitement peut être lent ou atteindre la limite du quota gratuit. "
+                   f"Pensez à traiter par lots plus petits.")
 
     if uploaded_files and st.button("🔍 Extraire les données", type="primary"):
         all_dfs = []
@@ -454,13 +559,17 @@ with tab2:
             with st.spinner(f"Analyse de {f.name}..."):
                 file_bytes = f.read()
                 if f.name.lower().endswith(".pdf"):
-                    df = extract_quote_from_pdf(file_bytes)
+                    df = extract_quote_from_pdf(file_bytes, label=f"[{f.name}]")
                 else:  # .xlsx / .xls
                     df = extract_quote_from_excel(file_bytes, f.name)
 
                 if df is not None and not df.empty:
                     df.insert(0, "Fichier_source", f.name)
                     all_dfs.append(df)
+
+            # 免费层限流保护：文件之间留间隔（最后一个不等）
+            if i < len(uploaded_files) - 1:
+                time.sleep(7)
             progress.progress((i + 1) / len(uploaded_files))
 
         if all_dfs:
