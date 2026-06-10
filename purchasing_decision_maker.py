@@ -174,6 +174,67 @@ Règles:
         st.code(raw)
         return None
 
+
+def extract_quote_from_excel(file_bytes, filename):
+    """Excel 报价 -> 文本 -> Gemini -> 结构化 JSON（与 PDF 共用字段）"""
+    api_key = st.secrets.get("GEMINI_API_KEY")
+    if not api_key:
+        st.error("⚠️ 未配置 GEMINI_API_KEY，请在 Streamlit Secrets 中添加。")
+        return None
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+
+    # 读取所有 sheet，拼成文本（保留行列结构）
+    try:
+        sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
+    except Exception as e:
+        st.error(f"读取 Excel 失败 ({filename}): {e}")
+        return None
+
+    text_parts = []
+    for sheet_name, sdf in sheets.items():
+        text_parts.append(f"--- Feuille: {sheet_name} ---")
+        text_parts.append(sdf.to_csv(index=False, header=False))
+    excel_text = "\n".join(text_parts)
+
+    prompt = f"""Tu es un assistant achats. Voici le contenu d'un devis fournisseur
+(canalisation/tuyauterie) exporté depuis un fichier Excel. Les colonnes peuvent
+avoir des noms variables selon le fournisseur.
+
+Extrais TOUTES les lignes de produits sous forme de tableau JSON.
+Renvoie UNIQUEMENT un tableau JSON (pas de texte, pas de markdown), où chaque objet a ces clés exactes:
+{json.dumps(QUOTE_FIELDS, ensure_ascii=False)}
+
+Règles:
+- Fournisseur: nom du fournisseur émetteur du devis
+- DE: diamètre extérieur (nombre uniquement)
+- PN: pression nominale (nombre uniquement)
+- Package: conditionnement (barre, couronne, touret...)
+- Quantite_ml: quantité en mètres linéaires (nombre)
+- Prix_unitaire: prix unitaire en €/ml (nombre uniquement, sans symbole)
+- Devise: ex "EUR"
+- Delai: délai de livraison si mentionné, sinon ""
+- Date_validite: date de validité de l'offre si mentionnée, sinon ""
+- Si une valeur est absente, mets "" ou null.
+- Une ligne par produit/référence.
+
+Contenu du fichier Excel:
+{excel_text}"""
+
+    response = model.generate_content(prompt)
+    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        return pd.DataFrame(data)
+    except json.JSONDecodeError:
+        st.error(f"模型返回的不是有效 JSON ({filename})，原始输出如下:")
+        st.code(raw)
+        return None
+
 # ===============================
 # 5. Google Sheets 存档 (未配置时静默跳过)
 # ===============================
@@ -381,7 +442,9 @@ with tab2:
     st.caption("Uploadez un ou plusieurs PDF de devis. Les données seront extraites et consolidées.")
 
     uploaded_files = st.file_uploader(
-        "Déposez vos devis PDF", type=["pdf"], accept_multiple_files=True
+        "Déposez vos devis (PDF ou Excel)",
+        type=["pdf", "xlsx", "xls"],
+        accept_multiple_files=True
     )
 
     if uploaded_files and st.button("🔍 Extraire les données", type="primary"):
@@ -389,7 +452,12 @@ with tab2:
         progress = st.progress(0, text="Extraction en cours...")
         for i, f in enumerate(uploaded_files):
             with st.spinner(f"Analyse de {f.name}..."):
-                df = extract_quote_from_pdf(f.read())
+                file_bytes = f.read()
+                if f.name.lower().endswith(".pdf"):
+                    df = extract_quote_from_pdf(file_bytes)
+                else:  # .xlsx / .xls
+                    df = extract_quote_from_excel(file_bytes, f.name)
+
                 if df is not None and not df.empty:
                     df.insert(0, "Fichier_source", f.name)
                     all_dfs.append(df)
