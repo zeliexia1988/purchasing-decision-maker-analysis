@@ -127,9 +127,9 @@ def calculate_all_totals(material, de, pn, quantity, package, dept_code, today):
 # ===============================
 # 4. 报价提取核心函数
 # ===============================
-# ⭐ 修改 1️⃣：新增 Total_Amount 和 Incoterm 字段
+# 字段含 Total_Amount 和 Incoterm
 QUOTE_FIELDS = ["Fournisseur", "Material", "DE", "PN", "Package",
-                "Quantite_ml", "Prix_unitaire", "Total_Amount", "Devise", 
+                "Quantite_ml", "Prix_unitaire", "Total_Amount", "Devise",
                 "Incoterm", "Delai", "Date_validite"]
 
 
@@ -182,7 +182,7 @@ def _parse_json_rows(raw, label=""):
         return None
 
 
-# ⭐ 修改 2️⃣：PROMPT_RULES 中新增 Total_Amount 和 Incoterm 说明
+# PROMPT_RULES 含 Total_Amount 和 Incoterm 说明
 PROMPT_RULES = f"""Renvoie UNIQUEMENT un tableau JSON (pas de texte, pas de markdown),
 où chaque objet a ces clés exactes:
 {json.dumps(QUOTE_FIELDS, ensure_ascii=False)}
@@ -310,7 +310,7 @@ Exemple de sortie: {{"DE": 3, "Material": 2, "Package": null, "Quantite_ml": 6, 
                 idx = col_map.get(field)
                 out[field] = data[idx] if (idx is not None and idx in data.columns) else ""
 
-            # ⭐ 修改 4️⃣：计算 Total_Amount (Quantite_ml × Prix_unitaire)
+            # 计算 Total_Amount (Quantite_ml × Prix_unitaire)
             def calc_total(row):
                 try:
                     qty = float(str(row.get("Quantite_ml", "")).replace(",", ".").strip())
@@ -322,7 +322,7 @@ Exemple de sortie: {{"DE": 3, "Material": 2, "Package": null, "Quantite_ml": 6, 
 
             # PN：优先描述里正则提取
             out["PN"] = out["Material"].apply(_extract_pn)
-            # 供应商/货币/Incoterm：整表第一次出现的线索由 Gemini 之外简单补；留空交由用户校对
+            # 供应商/货币/Incoterm：留空交由用户校对
             out["Fournisseur"] = ""
             out["Devise"] = ""
             out["Incoterm"] = ""
@@ -454,33 +454,24 @@ def add_contract_prices(df):
 
 
 # ===============================
-# 6. Excel 导出
+# 6. Excel 导出（仅对数字单元格套用货币格式）
 # ===============================
-# ⭐ 修改 3️⃣：增加货币格式化
 def to_excel_bytes(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Devis")
-        
-        # 格式化货币列
-        workbook = writer.book
+
         worksheet = writer.sheets["Devis"]
-        from openpyxl.styles import numbers
-        
-        # 格式化 Total_Amount 列（如果存在）
-        if "Total_Amount" in df.columns:
-            col_idx = df.columns.get_loc("Total_Amount") + 1  # openpyxl 从列1开始
-            for row in range(2, len(df) + 2):
-                cell = worksheet.cell(row=row, column=col_idx)
-                cell.number_format = '#,##0.00 "€"'
-        
-        # 格式化 Prix_unitaire 列
-        if "Prix_unitaire" in df.columns:
-            col_idx = df.columns.get_loc("Prix_unitaire") + 1
-            for row in range(2, len(df) + 2):
-                cell = worksheet.cell(row=row, column=col_idx)
-                cell.number_format = '#,##0.00 "€"'
-    
+
+        # 对货币列：仅当单元格为数字时才套用货币格式
+        for col_name in ["Total_Amount", "Prix_unitaire"]:
+            if col_name in df.columns:
+                col_idx = df.columns.get_loc(col_name) + 1
+                for row in range(2, len(df) + 2):
+                    cell = worksheet.cell(row=row, column=col_idx)
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = '#,##0.00 "€"'
+
     return output.getvalue()
 
 # ===============================
