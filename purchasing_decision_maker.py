@@ -127,10 +127,8 @@ def calculate_all_totals(material, de, pn, quantity, package, dept_code, today):
 # ===============================
 # 4. 报价提取核心函数
 # ===============================
-# 字段含 Total_Amount 和 Incoterm
 QUOTE_FIELDS = ["Fournisseur", "Material", "DE", "PN", "Package",
-                "Quantite_ml", "Prix_unitaire", "Total_Amount", "Devise",
-                "Incoterm", "Delai", "Date_validite"]
+                "Quantite_ml", "Prix_unitaire", "Devise", "Delai", "Date_validite"]
 
 
 def _get_model():
@@ -182,7 +180,6 @@ def _parse_json_rows(raw, label=""):
         return None
 
 
-# PROMPT_RULES 含 Total_Amount 和 Incoterm 说明
 PROMPT_RULES = f"""Renvoie UNIQUEMENT un tableau JSON (pas de texte, pas de markdown),
 où chaque objet a ces clés exactes:
 {json.dumps(QUOTE_FIELDS, ensure_ascii=False)}
@@ -194,9 +191,7 @@ Règles:
 - Package: conditionnement (barre, couronne, touret...)
 - Quantite_ml: quantité (nombre)
 - Prix_unitaire: prix unitaire (nombre uniquement, sans symbole)
-- Total_Amount: montant total de la ligne = Quantite_ml × Prix_unitaire (nombre uniquement, sans symbole de devise)
 - Devise: ex "EUR", "USD"
-- Incoterm: terme commercial (ex: "FOB", "CIF", "DDP", "EXW", "DAP") si mentionné dans le devis, sinon ""
 - Delai: délai de livraison si mentionné, sinon ""
 - Date_validite: date de validité de l'offre si mentionnée, sinon ""
 - Si une valeur est absente, mets "" ou null.
@@ -310,22 +305,11 @@ Exemple de sortie: {{"DE": 3, "Material": 2, "Package": null, "Quantite_ml": 6, 
                 idx = col_map.get(field)
                 out[field] = data[idx] if (idx is not None and idx in data.columns) else ""
 
-            # 计算 Total_Amount (Quantite_ml × Prix_unitaire)
-            def calc_total(row):
-                try:
-                    qty = float(str(row.get("Quantite_ml", "")).replace(",", ".").strip())
-                    price = float(str(row.get("Prix_unitaire", "")).replace(",", ".").strip())
-                    return qty * price if (qty > 0 and price > 0) else ""
-                except (ValueError, TypeError):
-                    return ""
-            out["Total_Amount"] = out.apply(calc_total, axis=1)
-
             # PN：优先描述里正则提取
             out["PN"] = out["Material"].apply(_extract_pn)
-            # 供应商/货币/Incoterm：留空交由用户校对
+            # 供应商/货币：整表第一次出现的线索由 Gemini 之外简单补；留空交由用户校对
             out["Fournisseur"] = ""
             out["Devise"] = ""
-            out["Incoterm"] = ""
             out["Delai"] = ""
             out["Date_validite"] = ""
 
@@ -454,24 +438,12 @@ def add_contract_prices(df):
 
 
 # ===============================
-# 6. Excel 导出（仅对数字单元格套用货币格式）
+# 6. Excel 导出
 # ===============================
 def to_excel_bytes(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Devis")
-
-        worksheet = writer.sheets["Devis"]
-
-        # 对货币列：仅当单元格为数字时才套用货币格式
-        for col_name in ["Total_Amount", "Prix_unitaire"]:
-            if col_name in df.columns:
-                col_idx = df.columns.get_loc(col_name) + 1
-                for row in range(2, len(df) + 2):
-                    cell = worksheet.cell(row=row, column=col_idx)
-                    if isinstance(cell.value, (int, float)):
-                        cell.number_format = '#,##0.00 "€"'
-
     return output.getvalue()
 
 # ===============================
@@ -630,3 +602,4 @@ with tab2:
                     st.success(msg)
                 else:
                     st.warning(msg)
+
